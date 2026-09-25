@@ -1744,17 +1744,27 @@ a[href^="tel:"] {
   -webkit-user-select: none;
   user-select: none;
 }
-.tour-viewport canvas {
+/* Photo Sphere Viewer (vendor/psv.css) fills the viewer; its own loader,
+   notices and error overlay are replaced by the site's controls. */
+.tour-viewport .tour-psv {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
+  background: #040d0a;
   cursor: grab;
   touch-action: none;
+}
+.tour-viewport .tour-psv:active {
+  cursor: grabbing;
+}
+.tour-psv canvas {
   transition: filter 0.35s;
 }
-.tour-viewport.is-dragging canvas {
-  cursor: grabbing;
+.tour-psv .psv-loader-container,
+.tour-psv .psv-overlay,
+.tour-psv .psv-notification {
+  display: none !important;
 }
 .tour-viewport::after {
   content: "";

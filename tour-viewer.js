@@ -1,6 +1,9 @@
 (() => {
   'use strict';
 
+  // 3D-тур на Photo Sphere Viewer (vendor/psv.js, лицензия MIT). Движок показывает
+  // панораму и отвечает за перетаскивание, инерцию, колесо и масштаб двумя пальцами.
+  // Точки, карточки, экскурсия, гироскоп, VR и эффект присутствия — код сайта ниже.
   const root = document.querySelector('[data-tour-viewer]');
   if (!root) return;
 
@@ -17,7 +20,6 @@
     for (const element of [document.querySelector('header'), document.querySelector('.tour-intro')]) if (element) observer.observe(element);
   }
 
-  const canvas = root.querySelector('canvas');
   const fallback = root.querySelector('[data-tour-fallback]');
   const statusLine = root.querySelector('[data-vr-status]');
   const announcer = root.querySelector('[data-tour-announce]');
@@ -40,13 +42,20 @@
     announce(`${title} ${text}`);
   }
 
-  let gl = null;
-  try {
-    gl = canvas.getContext('webgl', { antialias: true, alpha: false, xrCompatible: true }) || canvas.getContext('experimental-webgl');
-  } catch {}
-  if (!gl) {
-    fallback.hidden = false;
-    canvas.hidden = true;
+  // The engine draws into its own element; older markup had a bare <canvas> instead.
+  root.querySelector(':scope > canvas')?.remove();
+  let stage = root.querySelector('[data-tour-stage]');
+  if (!stage) {
+    stage = document.createElement('div');
+    stage.className = 'tour-psv';
+    stage.setAttribute('data-tour-stage', '');
+    stage.setAttribute('aria-hidden', 'true');
+    root.prepend(stage);
+  }
+  const PSV = window.RssmpPSV;
+  if (!PSV || !PSV.Viewer) {
+    showFallback('Не удалось загрузить модуль 3D-тура.', 'Обновите страницу. Если ошибка повторится, откройте сайт в другом браузере.', true);
+    fallback.querySelector('[data-tour-retry]')?.addEventListener('click', () => location.reload());
     return;
   }
 
@@ -120,12 +129,13 @@
   const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
   const datasetKey = (prefix, name) => prefix + name.replace(/(?:^|-)(\w)/g, (match, letter) => letter.toUpperCase());
 
-  // Panorama files and their previews come from the page (TOUR_PANORAMAS in
+  // Panorama files, previews and tiles come from the page (TOUR_PANORAMAS in
   // build_pages.py); the paths in `scenes` above are defaults for older markup.
   for (const name of Object.keys(scenes)) {
     const image = root.dataset[datasetKey('panorama', name)];
     if (image) scenes[name].image = image;
     scenes[name].preview = root.dataset[datasetKey('preview', name)] || null;
+    try { scenes[name].tiles = JSON.parse(root.dataset[datasetKey('tiles', name)] || 'null'); } catch { scenes[name].tiles = null; }
   }
   // While classes B and C share the same demonstration panoramas, the page shows
   // one demonstration tour without a class choice. With four separate files the
@@ -170,254 +180,107 @@
     if (value) value.textContent = String(count);
     if (label) label.textContent = plural(count, forms) + suffix;
   }
+  // Tiles are used only when every scene has them: the engine works in one mode.
+  const tilesMode = tourScenes.every(scene => scene.tiles && scene.tiles.base && Array.isArray(scene.tiles.levels) && scene.tiles.levels.length > 0);
 
+  // Angles are kept in radians; the engine counts the field of view in degrees
+  // and the zoom as 0–100 between the widest and the narrowest view.
   const TAU = Math.PI * 2;
   const DEFAULT_FOV = Math.PI / 2.25, MIN_FOV = 0.58, MAX_FOV = 1.72, MAX_PITCH = 1.28;
+  const toDegrees = radians => radians * 180 / Math.PI;
+  const toRadians = degrees => degrees * Math.PI / 180;
   const clampFov = value => Math.max(MIN_FOV, Math.min(MAX_FOV, value));
   const clampPitch = value => Math.max(-MAX_PITCH, Math.min(MAX_PITCH, value));
-  // `state` holds the view on screen. The camera eases towards `goal`; `flight`
-  // is a scripted move (to a point, into another scene, the opening reveal).
-  const state = { vehicle: 'b', scene: 'b-exterior', yaw: 0, pitch: -0.03, fov: DEFAULT_FOV, dragging: false, auto: false, gyro: false, presence: false };
-  const goal = { yaw: 0, pitch: -0.03, fov: DEFAULT_FOV };
-  const velocity = { yaw: 0, pitch: 0 };
-  let flight = null;
-  let width = 1, height = 1, needsResize = true, texture = null, xrSession = null, ambient = null;
-  let lastFrame = performance.now(), sceneLoadId = 0, rafId = 0, inView = true, contextLost = false;
-  // The picture is redrawn only when the view, size, texture or hotspots change.
-  let drawnKey = '', textureVersion = 0;
-
-  // WebGL setup. Any failure here shows a readable message instead of an empty frame.
-  const vertexSource = `
-    attribute vec3 a_position;
-    attribute vec2 a_uv;
-    uniform mat4 u_projection;
-    uniform mat4 u_view;
-    varying vec2 v_uv;
-    void main(){
-      v_uv = a_uv;
-      gl_Position = u_projection * u_view * vec4(a_position, 1.0);
-    }
-  `;
-  // High precision where available: with mediump, texture coordinates of large
-  // panoramas are rounded on many phone GPUs and fine detail turns blocky.
-  const fragmentSource = `
-    #ifdef GL_FRAGMENT_PRECISION_HIGH
-    precision highp float;
-    #else
-    precision mediump float;
-    #endif
-    varying vec2 v_uv;
-    uniform sampler2D u_texture;
-    uniform float u_exposure;
-    void main(){
-      vec4 color = texture2D(u_texture, v_uv);
-      color.rgb *= u_exposure;
-      gl_FragColor = color;
-    }
-  `;
-  let program, indexCount = 0, projectionLocation, viewLocation, exposureLocation, indexBuffer;
-  function compile(type, source) {
-    const shader = gl.createShader(type);
-    gl.shaderSource(shader, source);
-    gl.compileShader(shader);
-    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader) || 'shader');
-    return shader;
-  }
-  try {
-    program = gl.createProgram();
-    gl.attachShader(program, compile(gl.VERTEX_SHADER, vertexSource));
-    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fragmentSource));
-    gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program) || 'link');
-    gl.useProgram(program);
-
-    const positions = [], uvs = [], indices = [];
-    const segments = 80, rings = 48;
-    for (let y = 0; y <= rings; y++) {
-      const v = y / rings, phi = v * Math.PI;
-      for (let x = 0; x <= segments; x++) {
-        const u = x / segments, theta = u * Math.PI * 2;
-        positions.push(-Math.sin(theta) * Math.sin(phi) * 10, Math.cos(phi) * 10, Math.cos(theta) * Math.sin(phi) * 10);
-        // DOM images have their first row at the top. Mapping v directly keeps
-        // the panorama upright without relying on driver-specific unpack flips.
-        uvs.push(u, v);
-      }
-    }
-    for (let y = 0; y < rings; y++) for (let x = 0; x < segments; x++) {
-      const a = y * (segments + 1) + x, b = a + segments + 1;
-      indices.push(a, b, a + 1, b, b + 1, a + 1);
-    }
-    const bufferData = (data, itemSize, location) => {
-      gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
-      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
-      gl.enableVertexAttribArray(location);
-      gl.vertexAttribPointer(location, itemSize, gl.FLOAT, false, 0, 0);
-    };
-    bufferData(positions, 3, gl.getAttribLocation(program, 'a_position'));
-    bufferData(uvs, 2, gl.getAttribLocation(program, 'a_uv'));
-    indexBuffer = gl.createBuffer();
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW);
-    indexCount = indices.length;
-    projectionLocation = gl.getUniformLocation(program, 'u_projection');
-    viewLocation = gl.getUniformLocation(program, 'u_view');
-    exposureLocation = gl.getUniformLocation(program, 'u_exposure');
-    gl.uniform1i(gl.getUniformLocation(program, 'u_texture'), 0);
-    gl.disable(gl.CULL_FACE);
-    gl.enable(gl.DEPTH_TEST);
-  } catch {
-    showFallback('Не удалось запустить 3D-графику.', 'Откройте страницу в современной версии Chrome, Safari, Firefox или Edge.');
-    canvas.hidden = true;
-    return;
-  }
-
-  canvas.addEventListener('webglcontextlost', event => {
-    event.preventDefault();
-    contextLost = true;
-    stopLoop();
-    showFallback('3D-графика временно остановлена.', 'Обновите страницу, чтобы восстановить панорамный тур.');
-  });
-  canvas.addEventListener('webglcontextrestored', () => location.reload());
-
-  function multiply(a, b) {
-    const out = new Float32Array(16);
-    for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
-      out[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
-    }
-    return out;
-  }
-  function viewMatrix(yaw, pitch) {
-    const cy = Math.cos(yaw), sy = Math.sin(yaw), cx = Math.cos(-pitch), sx = Math.sin(-pitch);
-    const ry = new Float32Array([cy,0,-sy,0, 0,1,0,0, sy,0,cy,0, 0,0,0,1]);
-    const rx = new Float32Array([1,0,0,0, 0,cx,sx,0, 0,-sx,cx,0, 0,0,0,1]);
-    return multiply(rx, ry);
-  }
-  function perspective(fov, aspect, near = 0.1, far = 100) {
-    const f = 1 / Math.tan(fov / 2), nf = 1 / (near - far), out = new Float32Array(16);
-    out[0] = f / aspect; out[5] = f; out[10] = (far + near) * nf; out[11] = -1; out[14] = 2 * far * near * nf;
-    return out;
-  }
-  function applyMatrix(m, v) {
-    return [m[0]*v[0]+m[4]*v[1]+m[8]*v[2], m[1]*v[0]+m[5]*v[1]+m[9]*v[2], m[2]*v[0]+m[6]*v[1]+m[10]*v[2]];
-  }
-
-  function resize() {
-    const dpr = Math.min(devicePixelRatio || 1, 2), rect = canvas.getBoundingClientRect();
-    const nextW = Math.max(1, Math.round(rect.width * dpr)), nextH = Math.max(1, Math.round(rect.height * dpr));
-    if (canvas.width !== nextW || canvas.height !== nextH) { canvas.width = nextW; canvas.height = nextH; }
-    width = canvas.width; height = canvas.height;
-    needsResize = false;
-  }
-  if ('ResizeObserver' in window) new ResizeObserver(() => { needsResize = true; }).observe(canvas);
-  window.addEventListener('resize', () => { needsResize = true; }, { passive: true });
-
-  // Textures. Power-of-two sizes allow mipmaps (no shimmer when zoomed out or near
-  // the poles) and a repeating horizontal wrap (no seam behind the viewer) in WebGL 1.
-  const anisotropic = gl.getExtension('EXT_texture_filter_anisotropic') || gl.getExtension('WEBKIT_EXT_texture_filter_anisotropic');
-  // Phones get at most 4096 px: an 8K panorama with mipmaps needs about 170 MB of video memory.
-  const lightDevice = matchMedia('(pointer: coarse)').matches || (navigator.deviceMemory || 8) < 8;
-  const textureLimit = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE), lightDevice ? 4096 : 8192);
-  const powerOfTwo = n => 2 ** Math.round(Math.log2(Math.max(1, n)));
-  function upload(image, w, h) {
-    let source = image;
-    if (image.naturalWidth !== w || image.naturalHeight !== h) {
-      source = document.createElement('canvas');
-      source.width = w; source.height = h;
-      const context = source.getContext('2d', { alpha: false });
-      context.imageSmoothingQuality = 'high';
-      context.drawImage(image, 0, 0, w, h);
-    }
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, source);
-  }
-  function setTexture(image) {
-    if (!texture) texture = gl.createTexture();
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-    let w = Math.min(textureLimit, powerOfTwo(image.naturalWidth)), h = Math.min(textureLimit, powerOfTwo(image.naturalHeight));
-    gl.getError();
-    upload(image, w, h);
-    let error = gl.getError();
-    // Not enough video memory: try again at half the size.
-    while (error === gl.OUT_OF_MEMORY && w > 1024) {
-      w /= 2; h = Math.max(1, h / 2);
-      upload(image, w, h);
-      error = gl.getError();
-    }
-    if (error !== gl.NO_ERROR) throw new Error(`WebGL texture error: ${error}`);
-    gl.generateMipmap(gl.TEXTURE_2D);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    if (anisotropic) gl.texParameterf(gl.TEXTURE_2D, anisotropic.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(8, gl.getParameter(anisotropic.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
-    textureVersion++;
-  }
-
-  // Camera motion.
+  const zoomOf = fov => Math.max(0, Math.min(100, (MAX_FOV - clampFov(fov)) / (MAX_FOV - MIN_FOV) * 100));
+  const fovOf = zoom => MAX_FOV + (MIN_FOV - MAX_FOV) * zoom / 100;
+  const shortestArc = (from, to) => { let d = (to - from) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; };
   const motionQuery = matchMedia('(prefers-reduced-motion: reduce)');
   const reducedMotion = () => motionQuery.matches || document.documentElement.classList.contains('no-motion');
-  const easeInOut = t => t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
-  const easeOut = t => 1 - (1 - t) ** 3;
-  const nearestYaw = (target, from) => target + TAU * Math.round((from - target) / TAU);
-  let gyroYawOffset = null;
-  function stopMotion() { velocity.yaw = velocity.pitch = 0; }
-  function setView(view) {
-    state.yaw = goal.yaw = view.yaw;
-    state.pitch = goal.pitch = view.pitch;
-    state.fov = goal.fov = view.fov;
+  const isAbort = error => Boolean(PSV.utils?.isAbortError?.(error) || error?.name === 'AbortError');
+  const state = { vehicle: 'b', scene: 'b-exterior', dragging: false, auto: false, gyro: false, presence: false };
+
+  // three.js inside the engine needs WebGL 2 (Chrome, Edge, Firefox, Safari 15+). The engine
+  // itself does not throw without it, so the check comes first.
+  const hasWebGL2 = (() => {
+    try {
+      const gl = document.createElement('canvas').getContext('webgl2');
+      gl?.getExtension('WEBGL_lose_context')?.loseContext();
+      return Boolean(gl);
+    } catch { return false; }
+  })();
+  if (!hasWebGL2) {
+    stage.hidden = true;
+    showFallback('Не удалось запустить 3D-графику.', 'Откройте страницу в современной версии Chrome, Safari, Firefox или Edge.');
+    return;
   }
-  // Scripted move; `done` runs on arrival. A locked move (walking into another
-  // scene) is not interrupted by dragging.
-  function flyTo(target, done = null, { duration = 0, ease = easeInOut, locked = false, from = null } = {}) {
-    stopMotion();
-    const start = from || { yaw: state.yaw, pitch: state.pitch, fov: state.fov };
-    const to = { yaw: nearestYaw(target.yaw, start.yaw), pitch: clampPitch(target.pitch), fov: clampFov(target.fov ?? Math.min(state.fov, DEFAULT_FOV)) };
+  let viewer = null;
+  try {
+    const config = {
+      container: stage,
+      navbar: false,
+      loadingImg: null,
+      loadingTxt: '',
+      minFov: toDegrees(MIN_FOV),
+      maxFov: toDegrees(MAX_FOV),
+      defaultZoomLvl: zoomOf(DEFAULT_FOV),
+      mousewheel: true,
+      mousewheelCtrlKey: false,
+      touchmoveTwoFingers: false,
+      keyboard: false,
+      moveInertia: !reducedMotion(),
+      canvasBackground: '#040d0a',
+      lang: { loading: 'Загрузка…', loadError: 'Не удалось загрузить панораму', webglError: 'Не удалось запустить 3D-графику', twoFingers: 'Перемещайте панораму двумя пальцами', ctrlZoom: 'Масштаб — Ctrl и колесо мыши' }
+    };
+    // Tiles: the small preview appears at once, then only the visible parts load at the needed detail.
+    if (tilesMode) config.adapter = [PSV.EquirectangularTilesAdapter, { showErrorTile: false, baseBlur: true }];
+    viewer = new PSV.Viewer(config);
+  } catch {
+    stage.hidden = true;
+    showFallback('Не удалось запустить 3D-графику.', 'Откройте страницу в современной версии Chrome, Safari, Firefox или Edge.');
+    return;
+  }
+  const engineCanvas = stage.querySelector('canvas');
+  engineCanvas?.addEventListener('webglcontextlost', event => {
+    event.preventDefault();
+    showFallback('3D-графика временно остановлена.', 'Обновите страницу, чтобы восстановить панорамный тур.');
+  });
+  engineCanvas?.addEventListener('webglcontextrestored', () => location.reload());
+  if ('ResizeObserver' in window) new ResizeObserver(() => viewer.autoSize()).observe(root);
+  const currentView = () => {
+    const position = viewer.getPosition();
+    return { yaw: position.yaw, pitch: position.pitch, fov: fovOf(viewer.getZoomLevel()) };
+  };
+
+  // Scripted camera moves (a point, a door, the opening reveal) use the engine's
+  // animation; any drag or wheel stops it. The promise tells whether it arrived.
+  let flight = null, gyroYawOffset = null;
+  function flyTo(target, done = null, { duration = 0 } = {}) {
+    const from = currentView();
+    const to = { yaw: target.yaw, pitch: clampPitch(target.pitch), fov: clampFov(target.fov ?? Math.min(from.fov, DEFAULT_FOV)) };
     if (state.gyro) gyroYawOffset = null;
-    if (reducedMotion() || !inView || document.hidden || state.gyro) {
-      flight = null;
-      setView(to);
+    if (reducedMotion() || document.hidden || state.gyro) {
+      viewer.rotate({ yaw: to.yaw, pitch: to.pitch });
+      viewer.zoom(zoomOf(to.fov));
       done?.();
-      return;
+      return Promise.resolve(true);
     }
-    const distance = Math.hypot(to.yaw - start.yaw, to.pitch - start.pitch, (to.fov - start.fov) * 2);
-    flight = { from: start, to, start: performance.now(), duration: duration || Math.min(1100, 400 + distance * 320), ease, done, locked };
+    const distance = Math.hypot(shortestArc(from.yaw, to.yaw), to.pitch - from.pitch, (to.fov - from.fov) * 2);
+    const animation = viewer.animate({ yaw: to.yaw, pitch: to.pitch, zoom: zoomOf(to.fov), speed: duration || Math.min(1100, 400 + distance * 320) });
+    if (!animation) { done?.(); return Promise.resolve(true); }
+    flight = animation;
+    return Promise.resolve(animation).then(completed => {
+      if (flight === animation) flight = null;
+      if (completed) done?.();
+      return completed;
+    });
   }
   // Where to aim at a point so that the description card does not cover it:
   // left of centre on wide screens (card on the right), above centre on phones (card at the bottom).
   const narrowLayout = matchMedia('(max-width: 800px)');
   function framing(spot) {
-    const fov = Math.min(state.fov, DEFAULT_FOV), t = Math.tan(fov / 2), aspect = root.clientWidth / Math.max(1, root.clientHeight);
+    const fov = Math.min(currentView().fov, DEFAULT_FOV), t = Math.tan(fov / 2), aspect = root.clientWidth / Math.max(1, root.clientHeight);
     if (narrowLayout.matches) return { yaw: spot.yaw, pitch: spot.pitch - Math.atan(0.42 * t), fov };
     return { yaw: spot.yaw + Math.atan(0.3 * t * aspect), pitch: spot.pitch, fov };
-  }
-  function stepCamera(now, dt) {
-    if (flight) {
-      const t = Math.min(1, (now - flight.start) / flight.duration), e = flight.ease(t), { from, to } = flight;
-      setView({ yaw: from.yaw + (to.yaw - from.yaw) * e, pitch: from.pitch + (to.pitch - from.pitch) * e, fov: from.fov + (to.fov - from.fov) * e });
-      if (t === 1) {
-        const { done } = flight;
-        flight = null;
-        done?.();
-      }
-      return;
-    }
-    if (state.auto && !state.dragging) goal.yaw += dt * 0.08;
-    if (!state.dragging && (velocity.yaw || velocity.pitch)) {
-      goal.yaw += velocity.yaw * dt;
-      goal.pitch = clampPitch(goal.pitch + velocity.pitch * dt);
-      const decay = Math.exp(-dt * 4);
-      velocity.yaw *= decay; velocity.pitch *= decay;
-      if (Math.hypot(velocity.yaw, velocity.pitch) < 0.01) stopMotion();
-    }
-    // Keep angles small: the view and the goal move by whole turns together, so nothing jumps.
-    const turns = Math.round(goal.yaw / TAU);
-    if (turns) { goal.yaw -= turns * TAU; state.yaw -= turns * TAU; }
-    const k = state.gyro || reducedMotion() ? 1 : 1 - Math.exp(-dt * (state.dragging ? 22 : 11));
-    for (const axis of ['yaw', 'pitch', 'fov']) {
-      const diff = goal[axis] - state[axis];
-      state[axis] = Math.abs(diff) < 1e-4 ? goal[axis] : state[axis] + diff * k;
-    }
   }
 
   // Hotspots. Buttons are always paired with the scene they were built for,
@@ -491,6 +354,22 @@
       }
     });
   }
+  // Marks follow the picture: the engine reports every redraw.
+  function updateHotspots() {
+    if (!placedHotspots.length) return;
+    const w = root.clientWidth, h = root.clientHeight;
+    for (const { spot, button } of placedHotspots) {
+      const position = { yaw: spot.yaw, pitch: spot.pitch };
+      let point = null;
+      if (viewer.dataHelper.isPointVisible(position)) {
+        point = viewer.dataHelper.sphericalCoordsToViewerCoords(position);
+        if (point.x < -0.075 * w || point.x > 1.075 * w || point.y < -0.075 * h || point.y > 1.075 * h) point = null;
+      }
+      button.hidden = !point;
+      if (point) button.style.transform = `translate(-50%,-50%) translate(${point.x.toFixed(1)}px, ${point.y.toFixed(1)}px)`;
+    }
+  }
+  viewer.addEventListener('render', updateHotspots);
   function markActive() {
     for (const { spot, button } of placedHotspots) button.classList.toggle('is-active', spot === activeHotspot);
   }
@@ -553,71 +432,6 @@
     speechSynthesis.speak(utterance);
   });
 
-  function updateHotspots(view) {
-    const aspect = width / height, tan = Math.tan(state.fov / 2), w = root.clientWidth, h = root.clientHeight;
-    for (const { spot, button } of placedHotspots) {
-      const cp = Math.cos(spot.pitch), world = [Math.sin(spot.yaw) * cp, Math.sin(spot.pitch), -Math.cos(spot.yaw) * cp];
-      const camera = applyMatrix(view, world), z = -camera[2];
-      const x = camera[0] / Math.max(z, 0.001) / (tan * aspect), y = camera[1] / Math.max(z, 0.001) / tan;
-      const visible = z > 0 && Math.abs(x) < 1.15 && Math.abs(y) < 1.15;
-      button.hidden = !visible;
-      if (visible) button.style.transform = `translate(-50%,-50%) translate(${((x + 1) * w / 2).toFixed(1)}px, ${((1 - y) * h / 2).toFixed(1)}px)`;
-    }
-  }
-
-  function draw(projection, view, viewport) {
-    gl.viewport(...viewport);
-    gl.clearColor(0.02, 0.055, 0.045, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    gl.useProgram(program);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.uniformMatrix4fv(projectionLocation, false, projection);
-    gl.uniformMatrix4fv(viewLocation, false, view);
-    gl.uniform1f(exposureLocation, 1);
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
-    gl.drawElements(gl.TRIANGLES, indexCount, gl.UNSIGNED_SHORT, 0);
-  }
-
-  function frame(now) {
-    rafId = 0;
-    if (xrSession || contextLost) return;
-    try {
-      if (needsResize) resize();
-      const dt = Math.min((now - lastFrame) / 1000, 0.05); lastFrame = now;
-      stepCamera(now, dt);
-      if (ambient?.panner) ambient.panner.pan.value = Math.sin(state.yaw) * 0.7;
-      const key = [state.yaw, state.pitch, state.fov, width, height, root.clientWidth, root.clientHeight, textureVersion, placedHotspots.length].join('|');
-      if (key !== drawnKey) {
-        drawnKey = key;
-        const view = viewMatrix(state.yaw, state.pitch);
-        // After a VR session the XR framebuffer may still be bound; draw to the page canvas.
-        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-        draw(perspective(state.fov, width / height), view, [0, 0, width, height]);
-        updateHotspots(view);
-      }
-    } catch {
-      showFallback('Не удалось отобразить панораму.', 'Обновите страницу или откройте её в современной версии браузера.');
-      return;
-    }
-    startLoop();
-  }
-  function startLoop() {
-    if (rafId || xrSession || contextLost || !inView) return;
-    rafId = requestAnimationFrame(frame);
-  }
-  function stopLoop() {
-    if (rafId) cancelAnimationFrame(rafId);
-    rafId = 0;
-  }
-  // Do not spend GPU time while the panorama is scrolled out of view.
-  if ('IntersectionObserver' in window) {
-    new IntersectionObserver(entries => {
-      inView = entries[entries.length - 1].isIntersecting;
-      if (inView) { lastFrame = performance.now(); drawnKey = ''; startLoop(); } else stopLoop();
-    }).observe(root);
-  }
-
   // Tabs: vehicle and view selectors follow the ARIA tabs pattern.
   const vehicleTabs = [...document.querySelectorAll('[data-vehicle]')];
   const viewTabs = [...root.querySelectorAll('[data-view]')];
@@ -651,22 +465,21 @@
   tabKeys(vehicleTabs);
   tabKeys(viewTabs);
 
-  // Scene loading: the small preview appears at once, the full panorama replaces
-  // it when downloaded. Afterwards the neighbouring scenes are fetched in advance.
+  // Scene loading. With tiles the engine shows the preview at once and then the
+  // visible tiles; with single files the preview is replaced by the full panorama.
+  // Afterwards the neighbouring scenes are fetched in advance.
   const vehicleTitle = document.querySelector('[data-current-vehicle]');
   const sceneName = root.querySelector('[data-scene-name]');
   const sceneIndex = root.querySelector('[data-scene-index]');
   const saveData = Boolean(navigator.connection && navigator.connection.saveData);
   const prefetched = new Map();
-  let firstLoad = true, sharpenTimer = 0;
+  let firstLoad = true, sceneLoadId = 0, slowTimer = 0;
   function loadImage(url) {
     return new Promise((resolve, reject) => {
       const image = new Image();
       image.decoding = 'async';
       const settle = () => (image.complete && image.naturalWidth ? resolve(image) : reject(new Error(url)));
       image.src = url;
-      // decode() prepares the pixels off the main thread before the WebGL upload.
-      // Some Safari versions reject decode() for large images that still load fine.
       if (image.decode) image.decode().then(() => resolve(image), () => { if (image.complete) settle(); else image.onload = image.onerror = settle; });
       else image.onload = image.onerror = settle;
     });
@@ -678,76 +491,59 @@
     image.src = url;
     prefetched.set(url, image);
   }
+  const tileUrl = (tiles, level, col, row) => `${tiles.base}${level}/${col}_${row}.jpg`;
+  function tilesPanorama(scene) {
+    const tiles = scene.tiles;
+    return { baseUrl: scene.preview || undefined, levels: tiles.levels, tileUrl: (col, row, level) => tileUrl(tiles, level, col, row) };
+  }
   function prefetchNeighbours(current) {
     for (const scene of tourScenes) {
       if (scene === current) continue;
       prefetch(scene.preview);
-      if (scene.vehicle === current.vehicle && !saveData) prefetch(scene.image);
+      if (scene.vehicle !== current.vehicle || saveData) continue;
+      if (!tilesMode) { prefetch(scene.image); continue; }
+      const level = scene.tiles.levels[0];
+      for (let col = 0; col < level.cols; col++) for (let row = 0; row < level.rows; row++) prefetch(tileUrl(scene.tiles, 0, col, row));
     }
   }
-  function loadScene(name, fromUser = false, view = null) {
+  async function loadFullImage(scene, loadId) {
+    const timer = setTimeout(() => { if (loadId === sceneLoadId) root.classList.add('is-sharpening'); }, 500);
+    try {
+      // Decoded in the background first, so the swap itself is instant. No position
+      // is passed: the engine keeps the current view and any running camera move.
+      await loadImage(scene.image);
+      if (loadId !== sceneLoadId) return;
+      const loaded = await viewer.setPanorama(scene.image, { transition: false, showLoader: false });
+      if (loaded && loadId === sceneLoadId) prefetchNeighbours(scene);
+    } catch (error) {
+      if (loadId !== sceneLoadId || isAbort(error)) return;
+      viewer.hideError();
+      setStatus('Панорама показана в сниженном качестве: полный файл не загрузился.');
+    } finally {
+      clearTimeout(timer);
+      if (loadId === sceneLoadId) root.classList.remove('is-sharpening');
+    }
+  }
+  async function loadScene(name, fromUser = false, view = null) {
     if (!own(scenes, name)) return;
-    const scene = scenes[name];
-    const loadId = ++sceneLoadId;
+    const scene = scenes[name], loadId = ++sceneLoadId, intro = firstLoad;
+    const walking = root.classList.contains('is-switching');
     const target = view || { yaw: scene.yaw, pitch: scene.pitch, fov: DEFAULT_FOV };
-    const intro = firstLoad;
-    // A short dip to dark hides the change of picture; a walk through a door is already dark.
-    const dip = !intro && !root.classList.contains('is-switching') && !reducedMotion();
-    const veilReady = dip ? new Promise(resolve => setTimeout(resolve, 260)) : Promise.resolve();
     state.scene = name; state.vehicle = scene.vehicle;
-    flight = null;
-    stopMotion();
     if (state.gyro) gyroYawOffset = null;
     closeCard(false);
     clearHotspots();
     fallback.hidden = true;
-    clearTimeout(sharpenTimer);
-    sharpenTimer = 0;
     root.classList.remove('is-sharpening');
-    root.classList.add('is-loading');
-    root.setAttribute('aria-busy', 'true');
-    let shown = '', fullFailed = false, previewFailed = !scene.preview;
-    const failed = () => {
+    clearTimeout(slowTimer);
+    // A quick switch shows only the engine's dip to black; the loading screen
+    // appears if loading takes longer.
+    const busy = () => {
       if (loadId !== sceneLoadId) return;
-      if (fullFailed && shown) {
-        root.classList.remove('is-sharpening');
-        setStatus('Панорама показана в сниженном качестве: полный файл не загрузился.');
-      } else if (fullFailed && previewFailed) {
-        showFallback('Не удалось загрузить панораму.', 'Проверьте подключение к интернету и повторите попытку.', true);
-      }
+      root.classList.add('is-loading');
+      root.setAttribute('aria-busy', 'true');
     };
-    const show = (image, full) => {
-      if (loadId !== sceneLoadId || shown === 'full') return;
-      try {
-        setTexture(image);
-      } catch {
-        if (!shown) showFallback('Не удалось отобразить панораму.', 'Обновите страницу или откройте её в современной версии браузера.', true);
-        return;
-      }
-      if (!shown) {
-        setView(target);
-        if (!reducedMotion()) flyTo(target, null, { from: { ...target, fov: clampFov(target.fov + (intro ? 0.3 : 0.16)) }, duration: intro ? 1200 : 800, ease: easeOut });
-        root.classList.remove('is-loading', 'is-switching');
-        root.removeAttribute('aria-busy');
-        buildHotspots(scene);
-        firstLoad = false;
-        if (fromUser) announce(`${scene.title}. Активных точек: ${scene.hotspots.length}.`);
-        if (guide && guide.pendingScene === name) continueGuide();
-      }
-      shown = full ? 'full' : 'preview';
-      if (full) {
-        clearTimeout(sharpenTimer);
-        root.classList.remove('is-sharpening');
-        prefetchNeighbours(scene);
-      } else if (fullFailed) {
-        failed();
-      } else {
-        sharpenTimer = setTimeout(() => { if (loadId === sceneLoadId && shown === 'preview') root.classList.add('is-sharpening'); }, 500);
-      }
-      startLoop();
-    };
-    if (scene.preview) loadImage(scene.preview).then(image => veilReady.then(() => show(image, false)), () => { previewFailed = true; failed(); });
-    loadImage(scene.image).then(image => veilReady.then(() => show(image, true)), () => { fullFailed = true; failed(); });
+    if (intro) busy(); else slowTimer = setTimeout(busy, 350);
     if (sceneName) sceneName.textContent = scene.title;
     if (sceneIndex) sceneIndex.textContent = `0${scene.view === 'exterior' ? 1 : 2} / 02`;
     syncTabs(viewTabs, tab => tab.dataset.view === scene.view);
@@ -755,14 +551,46 @@
     syncThumbs(scene.vehicle);
     if (vehicleTitle) vehicleTitle.textContent = vehicles[scene.vehicle].title;
     history.replaceState(null, '', `#${name}`);
+    const reveal = intro && !reducedMotion();
+    let loaded = false;
+    try {
+      loaded = await viewer.setPanorama(tilesMode ? tilesPanorama(scene) : (scene.preview || scene.image), {
+        position: { yaw: target.yaw, pitch: target.pitch },
+        zoom: zoomOf(reveal ? clampFov(target.fov + 0.3) : target.fov),
+        showLoader: false,
+        transition: intro || reducedMotion() ? false : { speed: walking ? 700 : 450, effect: 'black', rotation: false }
+      });
+    } catch (error) {
+      if (loadId !== sceneLoadId || isAbort(error)) return;
+      clearTimeout(slowTimer);
+      viewer.hideError();
+      showFallback('Не удалось загрузить панораму.', 'Проверьте подключение к интернету и повторите попытку.', true);
+      return;
+    }
+    if (!loaded || loadId !== sceneLoadId) return;
+    clearTimeout(slowTimer);
+    root.classList.remove('is-loading', 'is-switching');
+    root.removeAttribute('aria-busy');
+    buildHotspots(scene);
+    updateHotspots();
+    if (reveal) flyTo(target, null, { duration: 1200 });
+    firstLoad = false;
+    if (fromUser) announce(`${scene.title}. Активных точек: ${scene.hotspots.length}.`);
+    if (guide && guide.pendingScene === name) continueGuide();
+    if (!tilesMode && scene.preview && scene.preview !== scene.image) loadFullImage(scene, loadId);
+    else prefetchNeighbours(scene);
   }
   // Walking through a door: the camera moves towards it while the picture dims.
   function goToScene(name, via = null) {
     if (!own(scenes, name)) return;
     closeCard(false);
-    if (via && fallback.hidden && inView && !document.hidden && !state.gyro && !reducedMotion()) {
+    if (via && fallback.hidden && !document.hidden && !state.gyro && !reducedMotion()) {
       root.classList.add('is-switching');
-      flyTo({ yaw: via.yaw, pitch: via.pitch, fov: MIN_FOV + 0.12 }, () => loadScene(name, true), { duration: 700, locked: true });
+      const token = sceneLoadId;
+      flyTo({ yaw: via.yaw, pitch: via.pitch, fov: MIN_FOV + 0.12 }, null, { duration: 700 }).then(() => {
+        // A tab chosen during the walk wins over the door.
+        if (token === sceneLoadId) loadScene(name, true);
+      });
     } else {
       loadScene(name, true);
     }
@@ -775,16 +603,14 @@
     loadScene(name, true);
   }));
   vehicleTabs.forEach(button => button.addEventListener('click', () => {
-    const currentView = scenes[state.scene]?.view || 'exterior';
-    const name = `${button.dataset.vehicle}-${currentView}`;
+    const currentScene = scenes[state.scene]?.view || 'exterior';
+    const name = `${button.dataset.vehicle}-${currentScene}`;
     if (name === state.scene && fallback.hidden) return;
     stopGuide();
     loadScene(name, true);
   }));
 
   // Links to a view: #scene or #scene@yaw,pitch,fov (degrees), made by the «share» button.
-  const toRadians = degrees => degrees * Math.PI / 180;
-  const toDegrees = radians => Math.round(radians * 180 / Math.PI);
   function parseHash(raw) {
     const match = /^([a-z]+-[a-z]+)(?:@(-?\d{1,3}(?:\.\d+)?),(-?\d{1,2}(?:\.\d+)?)(?:,(\d{1,3}(?:\.\d+)?))?)?$/.exec(raw);
     const scene = match && sceneFromHash(match[1]);
@@ -815,8 +641,8 @@
     return copied;
   }
   shareButton?.addEventListener('click', async () => {
-    const yaw = Math.atan2(Math.sin(state.yaw), Math.cos(state.yaw));
-    const url = `${location.origin}${location.pathname}#${state.scene}@${toDegrees(yaw)},${toDegrees(state.pitch)},${toDegrees(state.fov)}`;
+    const view = currentView(), yaw = Math.atan2(Math.sin(view.yaw), Math.cos(view.yaw));
+    const url = `${location.origin}${location.pathname}#${state.scene}@${Math.round(toDegrees(yaw))},${Math.round(toDegrees(view.pitch))},${Math.round(toDegrees(view.fov))}`;
     if (navigator.share && matchMedia('(pointer: coarse)').matches) {
       try { await navigator.share({ title: document.title, url }); return; } catch (error) { if (error && error.name === 'AbortError') return; }
     }
@@ -831,10 +657,6 @@
   const autoButton = root.querySelector('[data-auto]');
   let guide = null;
   const dwellTime = spot => Math.min(12000, Math.max(5000, 2500 + spot.text.length * 45));
-  function setAuto(on) {
-    state.auto = on;
-    autoButton?.setAttribute('aria-pressed', String(on));
-  }
   function runGuideTimer(ms) {
     if (!guideTimer) return;
     guideTimer.style.setProperty('--dwell', `${ms}ms`);
@@ -894,76 +716,50 @@
     guide.timer = setTimeout(guideNext, 900);
   }
   guideButton?.addEventListener('click', () => (guide ? stopGuide('Экскурсия остановлена.') : startGuide()));
+
+  // Automatic rotation; it pauses while the panorama is held.
+  let autoFrame = 0, autoLast = 0;
+  function autoTick(now) {
+    autoFrame = 0;
+    if (!state.auto) return;
+    const dt = Math.min((now - autoLast) / 1000, 0.05);
+    autoLast = now;
+    if (!state.dragging && !flight && !document.hidden) {
+      const position = viewer.getPosition();
+      viewer.rotate({ yaw: position.yaw + dt * 0.08, pitch: position.pitch });
+    }
+    autoFrame = requestAnimationFrame(autoTick);
+  }
+  function setAuto(on) {
+    state.auto = on;
+    autoButton?.setAttribute('aria-pressed', String(on));
+    if (on && !autoFrame) { autoLast = performance.now(); autoFrame = requestAnimationFrame(autoTick); }
+  }
   autoButton?.addEventListener('click', () => {
     if (!state.auto) stopGuide();
     setAuto(!state.auto);
   });
 
-  // Mouse, touch and pen. One pointer turns the view, two pointers zoom; a flick keeps turning briefly.
-  const pointers = new Map();
-  let pinch = null, pinched = false, lastMove = 0;
-  const pointerDistance = () => { const [a, b] = [...pointers.values()]; return Math.hypot(a.x - b.x, a.y - b.y); };
-  // Direct input ends the guided tour and any scripted move except walking through a door.
+  // Direct input: the engine turns and zooms the panorama itself; here it only
+  // ends the guided tour and remembers that the visitor has taken control.
   function takeControl() {
-    if (flight && flight.locked) return false;
     stopGuide();
-    flight = null;
-    stopMotion();
     root.classList.add('has-interacted');
-    return true;
   }
-  canvas.addEventListener('pointerdown', event => {
-    if (!takeControl()) return;
-    if (pointers.size === 0) pinched = false;
-    pointers.set(event.pointerId, { x: event.clientX, y: event.clientY, t: event.timeStamp });
-    try { canvas.setPointerCapture(event.pointerId); } catch {}
-    if (pointers.size === 2) { pinch = { distance: pointerDistance(), fov: goal.fov }; pinched = true; }
-    state.dragging = true;
-    root.classList.add('is-dragging');
-  });
-  canvas.addEventListener('pointermove', event => {
-    const pointer = pointers.get(event.pointerId);
-    if (!pointer) return;
-    const dx = event.clientX - pointer.x, dy = event.clientY - pointer.y, seconds = Math.max(8, event.timeStamp - pointer.t) / 1000;
-    pointer.x = event.clientX; pointer.y = event.clientY; pointer.t = event.timeStamp;
-    if (pinch && pointers.size >= 2) {
-      const distance = pointerDistance();
-      if (distance > 0) goal.fov = clampFov(pinch.fov * pinch.distance / distance);
-      return;
-    }
-    const speed = state.fov / DEFAULT_FOV, dYaw = -dx * 0.0052 * speed, dPitch = dy * 0.0043 * speed;
-    if (state.gyro && gyroYawOffset !== null) gyroYawOffset += dYaw;
-    else goal.yaw += dYaw;
-    if (!state.gyro) goal.pitch = clampPitch(goal.pitch + dPitch);
-    velocity.yaw = velocity.yaw * 0.5 + dYaw / seconds * 0.5;
-    velocity.pitch = velocity.pitch * 0.5 + dPitch / seconds * 0.5;
-    lastMove = event.timeStamp;
-  });
-  const stopDrag = event => {
-    if (!pointers.delete(event.pointerId)) return;
-    if (pointers.size < 2) pinch = null;
-    if (pointers.size > 0) return;
-    state.dragging = false;
-    root.classList.remove('is-dragging');
-    // No inertia if the pointer rested before release, after a pinch, with the gyroscope or reduced motion.
-    if (event.timeStamp - lastMove > 90 || pinched || state.gyro || reducedMotion()) stopMotion();
-    else {
-      velocity.yaw = Math.max(-3, Math.min(3, velocity.yaw));
-      velocity.pitch = Math.max(-1.5, Math.min(1.5, velocity.pitch));
-    }
-  };
-  canvas.addEventListener('pointerup', stopDrag);
-  canvas.addEventListener('pointercancel', stopDrag);
-  canvas.addEventListener('lostpointercapture', stopDrag);
-  canvas.addEventListener('wheel', event => {
-    event.preventDefault();
-    if (!takeControl()) return;
-    const scale = event.deltaMode === 1 ? 33 : event.deltaMode === 2 ? 400 : 1;
-    goal.fov = clampFov(goal.fov + event.deltaY * scale * 0.001);
-  }, { passive: false });
-  root.querySelectorAll('[data-zoom]').forEach(button => button.addEventListener('click', () => {
-    if (takeControl()) goal.fov = clampFov(goal.fov + (button.dataset.zoom === 'in' ? -0.22 : 0.22));
-  }));
+  stage.addEventListener('pointerdown', () => { takeControl(); state.dragging = true; }, true);
+  for (const type of ['pointerup', 'pointercancel']) window.addEventListener(type, () => { state.dragging = false; }, true);
+  stage.addEventListener('wheel', takeControl, { capture: true, passive: true });
+  // Keys and the zoom buttons move smoothly; repeated presses add up.
+  let keyTarget = null;
+  function nudge(dYaw, dPitch, dFov) {
+    takeControl();
+    const base = keyTarget && flight ? keyTarget : currentView();
+    keyTarget = { yaw: base.yaw + dYaw, pitch: clampPitch(base.pitch + dPitch), fov: clampFov(base.fov + dFov) };
+    const target = keyTarget;
+    flyTo(target, () => { if (keyTarget === target) keyTarget = null; }, { duration: 500 });
+    if (reducedMotion()) keyTarget = null;
+  }
+  root.querySelectorAll('[data-zoom]').forEach(button => button.addEventListener('click', () => nudge(0, 0, button.dataset.zoom === 'in' ? -0.22 : 0.22)));
   root.addEventListener('keydown', event => {
     if (event.key === 'Escape') {
       if (!infoCard.hidden) { event.preventDefault(); stopGuide(); closeCard(); return; }
@@ -973,17 +769,17 @@
     if (event.target.closest('[role="tablist"], input, textarea')) return;
     const step = event.shiftKey ? 0.18 : 0.08;
     const moves = {
-      ArrowLeft: () => { goal.yaw -= step; },
-      ArrowRight: () => { goal.yaw += step; },
-      ArrowUp: () => { goal.pitch = clampPitch(goal.pitch + step); },
-      ArrowDown: () => { goal.pitch = clampPitch(goal.pitch - step); },
-      '+': () => { goal.fov = clampFov(goal.fov - 0.08); },
-      '=': () => { goal.fov = clampFov(goal.fov - 0.08); },
-      '-': () => { goal.fov = clampFov(goal.fov + 0.08); }
+      ArrowLeft: [-step, 0, 0],
+      ArrowRight: [step, 0, 0],
+      ArrowUp: [0, step, 0],
+      ArrowDown: [0, -step, 0],
+      '+': [0, 0, -0.08],
+      '=': [0, 0, -0.08],
+      '-': [0, 0, 0.08]
     };
     if (!own(moves, event.key)) return;
     event.preventDefault();
-    if (takeControl()) moves[event.key]();
+    nudge(...moves[event.key]);
   });
 
   // Fullscreen. iPhone Safari has no element fullscreen, so the viewer expands
@@ -995,7 +791,7 @@
     const active = nativeFullscreen() === root || root.classList.contains('is-pseudo-fullscreen');
     fullscreenButton.setAttribute('aria-label', active ? 'Выйти из полноэкранного режима' : 'Открыть на весь экран');
     root.classList.toggle('is-fullscreen', active);
-    needsResize = true;
+    requestAnimationFrame(() => viewer.autoSize());
   }
   function setPseudoFullscreen(on) {
     root.classList.toggle('is-pseudo-fullscreen', on);
@@ -1051,8 +847,7 @@
       }
     }
     stopGuide();
-    flight = null;
-    stopMotion();
+    viewer.stopAnimation();
     state.gyro = true;
     gyroYawOffset = null;
     setGyroPressed(true);
@@ -1071,10 +866,13 @@
   window.addEventListener('deviceorientation', event => {
     if (!state.gyro || event.alpha == null || event.beta == null || event.gamma == null) return;
     const sensor = orientationToView(event.alpha, event.beta, event.gamma);
-    // Keep the current view direction when the sensor takes over.
-    if (gyroYawOffset === null) gyroYawOffset = state.yaw - sensor.yaw;
-    state.yaw = goal.yaw = sensor.yaw + gyroYawOffset;
-    state.pitch = goal.pitch = clampPitch(sensor.pitch);
+    // Keep the current view direction when the sensor takes over; while the
+    // panorama is held, the finger sets the direction and the sensor follows.
+    if (gyroYawOffset === null || state.dragging) {
+      gyroYawOffset = viewer.getPosition().yaw - sensor.yaw;
+      if (state.dragging) return;
+    }
+    viewer.rotate({ yaw: sensor.yaw + gyroYawOffset, pitch: clampPitch(sensor.pitch) });
   });
 
   // Presence effect («Эффект присутствия»): synthesized spatial sound, red/blue light accents,
@@ -1082,7 +880,7 @@
   // or when the tab is hidden.
   const presenceButton = root.querySelector('[data-presence], [data-effects]');
   const legacySoundButton = root.querySelector('[data-sound]');
-  let suspendTimer = 0;
+  let suspendTimer = 0, ambient = null;
   function createAmbientSound() {
     const Context = window.AudioContext || window.webkitAudioContext;
     if (!Context) return null;
@@ -1102,6 +900,9 @@
     low.start(); high.start();
     return { context, master, panner };
   }
+  viewer.addEventListener('position-updated', event => {
+    if (ambient?.panner) ambient.panner.pan.value = Math.sin(event.position.yaw) * 0.7;
+  });
   async function updateAmbient() {
     try {
       if (state.presence && !ambient) ambient = createAmbientSound();
@@ -1154,8 +955,80 @@
   });
   window.addEventListener('pagehide', () => { stopSpeech(); ambient?.context.suspend(); });
 
-  // WebXR (HTTPS and a compatible headset only)
+  // VR headsets (WebXR; HTTPS and a compatible headset only). The engine has no
+  // WebXR mode, so the headset gets its own small WebGL sphere with the full panorama.
+  function createSphereRenderer(gl, imageUrl) {
+    const compile = (type, source) => {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader) || 'shader');
+      return shader;
+    };
+    const program = gl.createProgram();
+    gl.attachShader(program, compile(gl.VERTEX_SHADER, 'attribute vec3 p;attribute vec2 t;uniform mat4 m;uniform mat4 v;varying vec2 u;void main(){u=t;gl_Position=m*v*vec4(p,1.0);}'));
+    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, '#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\nvarying vec2 u;uniform sampler2D s;void main(){gl_FragColor=texture2D(s,u);}'));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error('link');
+    gl.useProgram(program);
+    const positions = [], uvs = [], indices = [], segments = 64, rings = 32;
+    for (let y = 0; y <= rings; y++) {
+      const v = y / rings, phi = v * Math.PI;
+      for (let x = 0; x <= segments; x++) {
+        const u = x / segments, theta = u * TAU;
+        positions.push(-Math.sin(theta) * Math.sin(phi) * 10, Math.cos(phi) * 10, Math.cos(theta) * Math.sin(phi) * 10);
+        uvs.push(u, v);
+      }
+    }
+    for (let y = 0; y < rings; y++) for (let x = 0; x < segments; x++) {
+      const a = y * (segments + 1) + x, b = a + segments + 1;
+      indices.push(a, b, a + 1, b, b + 1, a + 1);
+    }
+    const attribute = (data, size, name) => {
+      gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+      const location = gl.getAttribLocation(program, name);
+      gl.enableVertexAttribArray(location);
+      gl.vertexAttribPointer(location, size, gl.FLOAT, false, 0, 0);
+    };
+    attribute(positions, 3, 'p');
+    attribute(uvs, 2, 't');
+    const indexBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW);
+    const projectionLocation = gl.getUniformLocation(program, 'm'), viewLocation = gl.getUniformLocation(program, 'v');
+    gl.uniform1i(gl.getUniformLocation(program, 's'), 0);
+    const texture = gl.createTexture();
+    let ready = false;
+    loadImage(imageUrl).then(image => {
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, image);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      ready = true;
+    }, () => setStatus('Не удалось загрузить панораму для VR.'));
+    gl.disable(gl.CULL_FACE);
+    return {
+      draw(projection, view, viewport) {
+        gl.viewport(...viewport);
+        gl.clearColor(0.02, 0.055, 0.045, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        if (!ready) return;
+        gl.useProgram(program);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.uniformMatrix4fv(projectionLocation, false, projection);
+        gl.uniformMatrix4fv(viewLocation, false, view);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+        gl.drawElements(gl.TRIANGLES, indices.length, gl.UNSIGNED_SHORT, 0);
+      }
+    };
+  }
   const vrButton = root.querySelector('[data-vr]');
+  let xrSession = null;
   async function setupVR() {
     if (!vrButton || !navigator.xr || !window.isSecureContext) return;
     try { if (await navigator.xr.isSessionSupported('immersive-vr')) vrButton.hidden = false; } catch {}
@@ -1165,20 +1038,18 @@
     let session = null;
     try {
       stopGuide();
-      await gl.makeXRCompatible();
+      const gl = document.createElement('canvas').getContext('webgl', { xrCompatible: true, alpha: false });
+      if (!gl) throw new Error('webgl');
       session = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor'] });
       xrSession = session;
-      stopLoop();
+      if (gl.makeXRCompatible) await gl.makeXRCompatible();
+      const sphere = createSphereRenderer(gl, scenes[state.scene].image);
       session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
       const referenceSpace = await session.requestReferenceSpace('local');
       session.addEventListener('end', () => {
         xrSession = null;
-        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         vrButton.textContent = 'Войти в VR';
-        needsResize = true;
-        drawnKey = '';
-        lastFrame = performance.now();
-        startLoop();
+        viewer.needsUpdate();
       });
       const xrFrame = (time, frameData) => {
         const current = frameData.session, pose = frameData.getViewerPose(referenceSpace);
@@ -1186,7 +1057,7 @@
         if (pose) for (const view of pose.views) {
           const viewport = current.renderState.baseLayer.getViewport(view), matrix = new Float32Array(view.transform.inverse.matrix);
           matrix[12] = matrix[13] = matrix[14] = 0;
-          draw(view.projectionMatrix, matrix, [viewport.x, viewport.y, viewport.width, viewport.height]);
+          sphere.draw(view.projectionMatrix, matrix, [viewport.x, viewport.y, viewport.width, viewport.height]);
         }
         current.requestAnimationFrame(xrFrame);
       };
@@ -1195,8 +1066,6 @@
     } catch {
       if (session) session.end().catch(() => {});
       xrSession = null;
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      startLoop();
       setStatus('VR-режим недоступен на этом устройстве.');
     }
   });
@@ -1204,5 +1073,4 @@
   const requested = parseHash(location.hash.slice(1));
   loadScene(requested ? requested.scene : defaultScene, false, requested ? requested.view : null);
   setupVR();
-  startLoop();
 })();
